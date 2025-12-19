@@ -1,0 +1,182 @@
+#!/usr/bin/env python3
+"""
+Fusion Hat Plant Environment Monitoring (English Only)
+Features:
+- Voice input using Vosk STT (offline)
+- Soil moisture, light intensity, temperature & humidity monitoring
+- Automatic watering
+- English-only speech feedback via OpenAI TTS
+"""
+
+import time
+import os
+import sys
+from io import BytesIO
+
+from fusion_hat.adc import ADC
+from fusion_hat.modules import DHT11
+from fusion_hat.motor import Motor
+from fusion_hat.tts import OpenAI_TTS
+from fusion_hat.stt import Vosk as STT
+
+
+# ================= Configuration =================
+
+SOIL_ADC_PORT = 'A1'         # Soil moisture sensor (0–4095, higher = dryer)
+LIGHT_ADC_PORT = 'A0'        # Light sensor
+DHT11_PIN = 17               # DHT11 temperature/humidity
+PUMP_PORT = 'M0'             # Water pump motor port
+PUMP_POWER = 80              # Pump power (0–100)
+PUMP_TIME_SEC = 3            # Watering duration in seconds
+
+SOIL_DRY_THRESHOLD = 3000    # Above this = dry
+LIGHT_BRIGHT_THRESHOLD = 2000
+
+# Load OpenAI key
+try:
+    from secret import OPENAI_API_KEY
+except:
+    print("Please create secret.py and define OPENAI_API_KEY='your_key'.")
+    sys.exit(1)
+
+
+# ================= Initialization =================
+
+print("Initializing sensors...")
+
+soil = ADC(SOIL_ADC_PORT)
+light = ADC(LIGHT_ADC_PORT)
+dht = DHT11(DHT11_PIN)
+
+pump = Motor(PUMP_PORT)
+pump.power(0)
+
+tts = OpenAI_TTS(api_key=OPENAI_API_KEY)
+tts.set_voice('alloy')
+tts.set_model('gpt-4o-mini-tts')
+
+
+stt = STT(language="en-us")
+#stt.start()
+
+
+# ================= Helper Functions =================
+
+def read_environment():
+    soil_raw = soil.read()
+    light_raw = light.read()
+
+    humidity = None
+    temperature = None
+
+    # DHT11 may return zero sometimes; retry
+    for _ in range(5):
+        data = dht.read()
+        if data and data[0] != 0 and data[1] != 0:
+            humidity, temperature = data
+            break
+        time.sleep(0.1)
+
+    return soil_raw, light_raw, humidity, temperature
+
+
+def describe_light(value):
+    if value is None:
+        return "unknown"
+    return "high" if value > LIGHT_BRIGHT_THRESHOLD else "low"
+
+
+def describe_soil(value):
+    if value is None:
+        return "unknown"
+    return "too dry" if value > SOIL_DRY_THRESHOLD else "moist"
+
+
+def water_plant():
+    print("Watering started...")
+    pump.power(PUMP_POWER)
+    time.sleep(PUMP_TIME_SEC)
+    pump.power(0)
+    pump.stop()
+    print("Watering finished.")
+
+
+# ================= Main Loop =================
+
+def main():
+    print("===== Fusion Hat Plant Monitoring + Voice Interaction =====")
+    print("Say something like: 'Hi, how are you feeling today?'")
+
+    try:
+        while True:
+            print("\n--- Listening... ---")
+            text = stt.listen()
+
+            if not text:
+                print("No speech recognized.")
+                continue
+
+            print(f"You said: {text}")
+
+            # Read environment data
+            soil_raw, light_raw, humidity, temperature = read_environment()
+
+            soil_desc = describe_soil(soil_raw)
+            light_desc = describe_light(light_raw)
+
+            # -------- First Response: Soil Condition --------
+            if soil_raw > SOIL_DRY_THRESHOLD:
+                speak1 = (
+                    f"Hello, the soil is {soil_desc}. I need some water."
+                )
+            else:
+                speak1 = (
+                    f"Hello, the soil is {soil_desc}. No watering is needed for now."
+                )
+
+            print("Fusion Hat+:", speak1)
+            tts.say(speak1)
+
+            watered = False
+
+            # Automatic watering
+            if soil_raw > SOIL_DRY_THRESHOLD:
+                water_plant()
+                watered = True
+
+            # -------- Second Response: Light + Temperature + Humidity --------
+
+            if watered:
+                prefix = "The watering is done, "
+            else:
+                prefix = "No watering was done today, "
+
+            if temperature is not None:
+                temp_str = f"the temperature is {temperature:.1f} degrees Celsius"
+            else:
+                temp_str = "the temperature cannot be read"
+
+            if humidity is not None:
+                hum_str = f", and the humidity is about {humidity:.1f} percent"
+            else:
+                hum_str = ""
+
+            speak2 = (
+                f"{prefix}the light intensity is {light_desc}, "
+                f"{temp_str}{hum_str}."
+            )
+
+            print("Fusion Hat+:", speak2)
+            tts.say(speak2)
+
+            time.sleep(1)
+
+    except KeyboardInterrupt:
+        print("\nExiting program... turning off pump.")
+        pump.power(0)
+        pump.stop()
+        sys.exit(0)
+
+
+if __name__ == "__main__":
+    main()
