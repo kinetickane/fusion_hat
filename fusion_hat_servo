@@ -1,0 +1,335 @@
+#!/usr/bin/env python3
+"""
+Fusion HAT+: Voice-controlled multi-servo demo using fusion_hat.llm.OpenAI
+
+Flow:
+- At startup, ask how many servos to use (1–12).
+- Vosk STT converts speech to text (offline).
+- fusion_hat.llm.OpenAI parses natural language into a JSON command:
+    {
+      "mode": "all" | "sequential" | "single" | "unknown",
+      "servo_index": int | null   # 1-based index if mode == "single"
+    }
+- Code executes the corresponding servo motion and responds with TTS.
+"""
+
+import time
+import os
+import sys
+import json
+import re
+
+from fusion_hat.servo import Servo
+from fusion_hat.tts import OpenAI_TTS
+from fusion_hat.stt import Vosk as STT
+from fusion_hat.llm import OpenAI as LLMOpenAI  # <-- use Fusion Hat LLM wrapper
+
+# ------------ OpenAI API key ------------
+try:
+    from secret import OPENAI_API_KEY
+except ImportError:
+    print("Please create secret.py with OPENAI_API_KEY='your_api_key'.")
+    sys.exit(1)
+
+
+# ------------ Configuration ------------
+MAX_SERVOS = 12           # Maximum servos supported in this demo
+SWEEP_MIN = -45           # Sweep range for test motion
+SWEEP_MAX = 45
+SWEEP_STEP = 15
+SWEEP_DELAY = 0.1
+
+
+# ------------ LLM initialization ------------
+LLM_INSTRUCTIONS = """
+You are a command parser for a servo testing robot.
+
+You receive natural language from the user and must convert it into
+a structured JSON command.
+
+The robot can control a certain number of servos (1 to 12) and supports
+three actions:
+1) Test ALL servos at once.
+2) Test the servos one by one sequentially.
+3) Test only ONE specific servo by its index (for example,
+   "the second one" or "servo number 3").
+
+You MUST decide which mode the user wants.
+
+The JSON object you return MUST always follow this schema:
+{
+  "mode": "all" | "sequential" | "single" | "unknown",
+  "servo_index": integer or null  // 1-based index when mode is "single",
+                                  // null for all other modes.
+}
+
+Rules:
+- If the user clearly wants all servos tested together, use mode "all".
+- If the user clearly wants to test them one by one, use mode "sequential".
+- If the user clearly specifies a particular servo (by number or ordinal word,
+  e.g. "second", "third", "servo 2"), use mode "single" and set servo_index.
+- If the user intent is unclear, use mode "unknown" and servo_index = null.
+- Never add any extra text around the JSON. Output ONLY the JSON object.
+"""
+
+llm = LLMOpenAI(
+    api_key=OPENAI_API_KEY,
+    model="gpt-4o-mini",   # light and fast for command parsing
+)
+llm.set_max_messages(20)
+llm.set_instructions(LLM_INSTRUCTIONS)
+# Optional: we don't really need a welcome message here
+llm.set_welcome("Ready to parse servo commands.")
+
+
+# ------------ Helper: speech ------------
+def make_tts():
+    tts = OpenAI_TTS(api_key=OPENAI_API_KEY)
+    tts.set_voice("alloy")
+    tts.set_model("gpt-4o-mini-tts")
+    return tts
+
+
+def speak(tts, text: str):
+    """Print to console and speak via TTS."""
+    print(f"Fusion Hat+: {text}")
+    tts.say(text)
+
+
+# ------------ Fallback (simple local classification, in case LLM fails) ------------
+def fallback_classify_command(text: str, servo_count: int):
+    """Very simple local heuristic parser used only when LLM parsing fails."""
+    t = text.lower()
+    if "one by one" in t or "individually" in t or "each one" in t:
+        return "sequential", None
+    if "all" in t or "together" in t or "every" in t or "all servos" in t:
+        return "all", None
+
+    ORDINAL_WORDS = {
+        "first": 1,
+        "second": 2,
+        "third": 3,
+        "fourth": 4,
+        "fifth": 5,
+        "sixth": 6,
+        "seventh": 7,
+        "eighth": 8,
+        "ninth": 9,
+        "tenth": 10,
+        "eleventh": 11,
+        "twelfth": 12,
+    }
+    for word, idx in ORDINAL_WORDS.items():
+        if word in t and 1 <= idx <= servo_count:
+            return "single", idx
+
+    nums = re.findall(r"\b(\d+)\b", t)
+    for s in nums:
+        try:
+            n = int(s)
+            if 1 <= n <= servo_count:
+                return "single", n
+        except ValueError:
+            pass
+
+    return "unknown", None
+
+
+# ------------ Helper: extract JSON from LLM output ------------
+def extract_json_object(text: str):
+    """
+    Extract the first {...} JSON object from a string.
+    Handles cases where the model might accidentally wrap it in ```json ``` blocks.
+    """
+    # If already looks like pure JSON, try directly
+    t = text.strip()
+    if t.startswith("{") and t.endswith("}"):
+        return t
+
+    # Remove code fences if present
+    t = re.sub(r"^```(?:json)?", "", t, flags=re.IGNORECASE | re.MULTILINE)
+    t = re.sub(r"```$", "", t, flags=re.MULTILINE).strip()
+    if t.startswith("{") and t.endswith("}"):
+        return t
+
+    # Fallback: find the first {...} block
+    match = re.search(r"\{.*\}", text, flags=re.DOTALL)
+    if match:
+        return match.group(0)
+
+    return None
+
+
+# ------------ LLM-based command parser ------------
+def understand_command_with_llm(text: str, servo_count: int):
+    """
+    Use fusion_hat.llm.OpenAI to map natural language to a structured servo command.
+    Returns: (mode, servo_index)
+    """
+    if not text or not text.strip():
+        return "unknown", None
+
+    try:
+        prompt = (
+            f"User command: {text}\n"
+            f"Total servos connected: {servo_count}\n\n"
+            "Return ONLY a JSON object that follows the schema described in your instructions."
+        )
+
+        # Non-streaming response (string)
+        llm_response = llm.prompt(prompt)   # <- using fusion_hat.llm.OpenAI
+
+        # Extract JSON substring
+        json_text = extract_json_object(llm_response)
+        if not json_text:
+            raise ValueError("No JSON found in LLM response")
+
+        cmd = json.loads(json_text)
+
+        mode = cmd.get("mode", "unknown")
+        idx = cmd.get("servo_index", None)
+
+        if mode != "single":
+            idx = None
+        else:
+            # Validate index
+            if not isinstance(idx, int) or not (1 <= idx <= servo_count):
+                mode = "unknown"
+                idx = None
+
+        return mode, idx
+
+    except Exception as e:
+        print("LLM command parsing failed:", e)
+        # Fallback to simple local classification
+        return fallback_classify_command(text, servo_count)
+
+
+# ------------ Servo movement helpers ------------
+def center_all(servos):
+    """Set all servos to 0 degrees."""
+    for s in servos:
+        s.angle(0)
+        time.sleep(0.05)
+
+
+def sweep_servo(servo: Servo):
+    """Simple sweep for one servo."""
+    for angle in range(SWEEP_MIN, SWEEP_MAX + 1, SWEEP_STEP):
+        servo.angle(angle)
+        time.sleep(SWEEP_DELAY)
+    for angle in range(SWEEP_MAX, SWEEP_MIN - 1, -SWEEP_STEP):
+        servo.angle(angle)
+        time.sleep(SWEEP_DELAY)
+    servo.angle(0)
+    time.sleep(0.1)
+
+
+def test_all_servos(servos):
+    """Move all servos together with a simple sweep pattern."""
+    for angle in range(SWEEP_MIN, SWEEP_MAX + 1, SWEEP_STEP):
+        for s in servos:
+            s.angle(angle)
+        time.sleep(SWEEP_DELAY)
+    for angle in range(SWEEP_MAX, SWEEP_MIN - 1, -SWEEP_STEP):
+        for s in servos:
+            s.angle(angle)
+        time.sleep(SWEEP_DELAY)
+    for s in servos:
+        s.angle(0)
+    time.sleep(0.2)
+
+
+def test_servos_sequential(servos):
+    """Sweep each servo one by one."""
+    for i, s in enumerate(servos, start=1):
+        print(f"Testing servo #{i} sequentially...")
+        sweep_servo(s)
+
+
+def test_single_servo(servos, index_1_based: int):
+    """Sweep only the specified servo (1-based index)."""
+    if 1 <= index_1_based <= len(servos):
+        servo = servos[index_1_based - 1]
+        print(f"Testing servo #{index_1_based}...")
+        sweep_servo(servo)
+    else:
+        print(f"Servo index {index_1_based} out of range.")
+
+
+# ------------ Main ------------
+def main():
+    # Enable Fusion Hat speaker
+    os.system("fusion_hat enable_speaker")
+
+    # Ask how many servos
+    while True:
+        try:
+            n = int(input(f"How many servos do you want to control? (1-{MAX_SERVOS}): "))
+            if 1 <= n <= MAX_SERVOS:
+                servo_count = n
+                break
+            else:
+                print(f"Please enter a number between 1 and {MAX_SERVOS}.")
+        except ValueError:
+            print("Please enter a valid integer.")
+
+    print(f"Initializing {servo_count} servo(s)...")
+
+    servos = [Servo(i) for i in range(servo_count)]
+    center_all(servos)
+
+    tts = make_tts()
+    stt = STT(language="en-us")  # Vosk English model
+
+    speak(tts, f"Ready to control {servo_count} servos. You can speak natural English commands.")
+
+    print("Example phrases you can say:")
+    print('  - "Help me test these servos"                -> all together')
+    print('  - "I am thinking of testing them one by one" -> sequential')
+    print('  - "Test the second one please"               -> specific servo')
+    print('  - "Could you try only servo number five?"    -> specific servo')
+    print("Press Ctrl+C to exit.\n")
+
+    try:
+        while True:
+            print("\n--- Listening for command ---")
+            text = stt.listen(stream=False)
+
+            if not text:
+                print("No speech recognized.")
+                continue
+
+            print(f"You said: {text}")
+
+            mode, idx = understand_command_with_llm(text, servo_count)
+            print(f"Parsed command: mode={mode}, index={idx}")
+
+            if mode == "all":
+                speak(tts, "Easy. Running it now.")
+                test_all_servos(servos)
+
+            elif mode == "sequential":
+                speak(tts, "This is nothing difficult for me.")
+                test_servos_sequential(servos)
+
+            elif mode == "single":
+                if 1 <= idx <= servo_count:
+                    speak(tts, "As you wish.")
+                    test_single_servo(servos, idx)
+                else:
+                    speak(tts, f"I only have {servo_count} servos connected.")
+
+            else:
+                speak(tts, "Sorry, I am not sure what you want me to do with the servos.")
+
+            time.sleep(0.5)
+
+    except KeyboardInterrupt:
+        print("\nExiting. Centering servos...")
+        center_all(servos)
+        print("Goodbye!")
+
+
+if __name__ == "__main__":
+    main()
