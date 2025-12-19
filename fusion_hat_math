@@ -1,0 +1,161 @@
+#!/usr/bin/env python3
+"""
+Fusion Hat+ camera math solver demo
+
+Flow:
+- You speak to the device and at the same time show a piece of paper
+  with a math expression written on it.
+- The camera takes a photo.
+- An OpenAI multimodal model reads the expression from the image
+  and computes the result.
+- The device speaks the answer back in English.
+"""
+
+import time
+import os
+import sys
+
+from secret import OPENAI_API_KEY
+
+from picamera2 import Picamera2
+from fusion_hat.stt import Vosk as STT
+from fusion_hat.tts import OpenAI_TTS
+from fusion_hat.llm import OpenAI as LLMOpenAI
+
+
+# ================== LLM settings ==================
+
+INSTRUCTIONS = """
+You are a math assistant running on a small robot.
+
+The user will talk to you while also showing you a piece of paper
+with one or more handwritten or printed math expressions.
+
+Your job is:
+1. Look at the image and read the math expression(s) on the paper.
+2. Compute the correct numerical result for each expression.
+3. Respond in concise English, for example:
+   - "The answer is 42."
+   - "There are two expressions. The answers are 5 and 12."
+4. If you cannot clearly see any math expression, say that you
+   cannot see it clearly.
+
+If there is any conflict between what the user says and what is
+written on the paper, always trust the paper.
+"""
+
+WELCOME = (
+    "Hello, I am your math assistant. "
+    "Please talk to me and show me a piece of paper with a math expression."
+)
+
+
+# ================== Initialize LLM, STT, TTS, Camera ==================
+
+# LLM (OpenAI via fusion_hat.llm)
+llm = LLMOpenAI(
+    api_key=OPENAI_API_KEY,
+    model="gpt-4o"   # multimodal model (vision + text)
+)
+llm.set_max_messages(20)
+llm.set_instructions(INSTRUCTIONS)
+llm.set_welcome(WELCOME)
+
+# TTS
+tts = OpenAI_TTS(api_key=OPENAI_API_KEY)
+tts.set_voice("alloy")
+tts.set_model("gpt-4o-mini-tts")
+
+# STT (offline speech-to-text)
+stt = STT(language="en-us")
+
+# Enable Fusion Hat speaker (route audio to onboard speaker)
+os.system("fusion_hat enable_speaker")
+
+# Camera
+camera = Picamera2()
+config = camera.create_still_configuration(
+    main={"size": (640, 480)},
+)
+camera.configure(config)
+camera.start()
+time.sleep(2)  # give camera time to warm up
+
+
+# ================== Helper functions ==================
+
+def speak(text: str):
+    """Print to console and speak via TTS."""
+    print(f"Fusion Hat+: {text}")
+    tts.say(text)
+
+
+def capture_image(path: str):
+    """Capture a still image to the given file path."""
+    camera.capture_file(path)
+    print(f"Captured image to {path}")
+
+
+# ================== Main loop ==================
+
+def main():
+    print(WELCOME)
+    speak(WELCOME)
+
+    print("When you are ready, talk to me in English and show me a paper with a math expression.")
+    print("Press Ctrl+C to exit.\n")
+
+    try:
+        while True:
+            print("\n--- Listening for your voice ---")
+            # Listen once; non-streaming
+            text = stt.listen(stream=False)
+
+            if not text:
+                print("No speech recognized.")
+                speak("Sorry, I did not catch that. Please try again.")
+                continue
+
+            print(f"You said: {text}")
+
+            # Capture image of the paper after you finish speaking
+            img_path = "./math-paper.jpg"
+            time.sleep(0.5)  # small delay to ensure the paper is in place
+            capture_image(img_path)
+
+            # Build prompt for LLM
+            prompt_text = (
+                "The user just spoke to you and showed you a piece of paper "
+                "with one or more math expressions.\n\n"
+                f"User said: \"{text}\"\n\n"
+                "Please read the math expressions from the image and compute the result. "
+                "Answer in English, and clearly state the final numerical answer."
+            )
+
+            print("Asking the LLM to solve the expression(s)...")
+
+            try:
+                # Use non-streaming response so we can send the whole answer to TTS
+                answer = llm.prompt(prompt_text, image_path=img_path)
+                if not answer:
+                    raise ValueError("Empty response from LLM")
+
+                print("LLM answer:")
+                print(answer)
+                speak(answer)
+
+            except Exception as e:
+                print("Error while calling LLM:", e)
+                speak("Sorry, something went wrong when I tried to solve the math problem.")
+
+            time.sleep(0.5)
+
+    except KeyboardInterrupt:
+        print("\nExiting program...")
+        speak("Goodbye.")
+        camera.stop()
+        sys.exit(0)
+
+
+if __name__ == "__main__":
+    main()
